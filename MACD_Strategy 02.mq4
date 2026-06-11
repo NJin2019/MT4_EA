@@ -1,38 +1,43 @@
 //+------------------------------------------------------------------+
-//|                                              MACD_Strategy.mq4   |
-//|                              MACD 金叉买入 + 差距数组追踪截单策略   |
+//| MACD_Strategy.mq4                                                |
+//| MACD 金叉买入 + 差距数组追踪截单策略                              |
 //|                                                                  |
-//| 逻辑说明：                                                         |
-//|  1. 检测 MACD 快线和慢线同时在零轴以上，且快线从下向上穿越慢线（金叉）  |
-//|  2. 满足条件时打印买入价格，开 0.05 手 Buy 单                        |
-//|  3. 设置止盈 200 点                                                |
-//|  4. 用 12 元素循环数组追踪快线与慢线的差距（每个 5 分钟 K 线一个值）   |
-//|  5. 最新差距为正数 → 继续持有；为负数 → 快慢线交汇，立即平仓截单       |
-//|  6. 截单后打印盈利并清空数组                                         |
+//| 逻辑说明：                                                        |
+//| 1. 检测 MACD 快线和慢线同时在零轴以上，且快线从下向上穿越慢线（金叉）|
+//| 2. 检测之前12根K线的快慢线差距，若差距为零的次数 >= 4，不开仓      |
+//| 3. 满足条件时打印买入价格，开 0.05 手 Buy 单                       |
+//| 4. 设置止盈 400 点                                                |
+//| 5. 用 12 元素循环数组追踪快线与慢线的差距（每个 5 分钟 K 线一个值）|
+//| 6. 最新差距为正数 → 继续持有；为负数 → 快慢线交汇，立即平仓截单   |
+//| 7. 截单后打印盈利并清空数组                                        |
 //+------------------------------------------------------------------+
 #property copyright "MACD Strategy EA"
 #property version   "1.00"
 #property strict
 
 //--- 输入参数
-extern double Lots          = 0.05;   // 交易手数
-extern int    TakeProfit    = 200;    // 止盈点数（point）
-extern int    Slippage      = 3;      // 允许滑点
-extern int    MagicNumber   = 20260529; // 订单魔术号
+extern double Lots        = 0.05; // 交易手数
+extern int    TakeProfit  = 400;  // 止盈点数（point）※ 已从200改为400
+extern int    Slippage    = 3;    // 允许滑点
+extern int    MagicNumber = 20260529; // 订单魔术号
 
 //--- MACD 参数
-extern int    FastEMA       = 12;     // 快速 EMA 周期
-extern int    SlowEMA       = 26;     // 慢速 EMA 周期
-extern int    SignalSMA     = 9;      // 信号线 SMA 周期
+extern int FastEMA   = 12; // 快速 EMA 周期
+extern int SlowEMA   = 26; // 慢速 EMA 周期
+extern int SignalSMA = 9;  // 信号线 SMA 周期
 
 //--- 差距追踪数组参数
-#define GAP_SIZE 12                    // 差距数组大小（12 个 5 分钟 K 线 = 1 小时）
+#define GAP_SIZE 12  // 差距数组大小（12 个 5 分钟 K 线 = 1 小时）
+
+//--- 开仓过滤参数
+//    若之前 GAP_SIZE 根 K 线中，快慢线差距为零的次数 >= ZeroGapMaxCount，则不开仓
+extern int ZeroGapMaxCount = 4; // 允许差距为零的最大次数（超过此数则跳过开仓）
 
 //--- 全局变量
-double   gapArray[GAP_SIZE];           // 循环数组：存放快线与慢线的差距
-int      gapIndex      = 0;            // 当前循环数组写入位置
-int      gapCount      = 0;            // 已填入的有效元素数量
-datetime lastBarTime   = 0;           // 上一根 5 分钟 K 线的时间戳（用于检测新 K 线）
+double   gapArray[GAP_SIZE]; // 循环数组：存放快线与慢线的差距
+int      gapIndex   = 0;     // 当前循环数组写入位置
+int      gapCount   = 0;     // 已填入的有效元素数量
+datetime lastBarTime = 0;    // 上一根 5 分钟 K 线的时间戳（用于检测新 K 线）
 
 //+------------------------------------------------------------------+
 //| EA 初始化函数                                                     |
@@ -44,7 +49,8 @@ int OnInit()
    lastBarTime = 0;
 
    Print("MACD 金叉策略 EA 已启动。手数=", Lots,
-         " 止盈=", TakeProfit, " 点  差距数组大小=", GAP_SIZE);
+         " 止盈=", TakeProfit, " 点 差距数组大小=", GAP_SIZE,
+         " 零差距过滤阈值=", ZeroGapMaxCount);
    return(INIT_SUCCEEDED);
 }
 
@@ -64,19 +70,19 @@ void OnTick()
    //--- 仅在新的 5 分钟 K 线开始时处理一次逻辑（防止重复开单/重复计算）
    datetime curBarTime = iTime(Symbol(), PERIOD_M5, 0);
    if(curBarTime == lastBarTime)
-      return;                          // 同一根 K 线内，不重复处理
+      return; // 同一根 K 线内，不重复处理
    lastBarTime = curBarTime;
 
    //--- 读取已完成的上一根 5 分钟 K 线（shift=1）的 MACD 数值
-   //    使用已收盘 K 线，避免当前未完成 K 线的数值跳动
+   // 使用已收盘 K 线，避免当前未完成 K 线的数值跳动
    double macdMainPrev = iMACD(Symbol(), PERIOD_M5, FastEMA, SlowEMA, SignalSMA,
-                               PRICE_CLOSE, MODE_MAIN, 1);   // 快线（MACD 主线）
+                               PRICE_CLOSE, MODE_MAIN,   1); // 快线（MACD 主线）
    double macdSignPrev = iMACD(Symbol(), PERIOD_M5, FastEMA, SlowEMA, SignalSMA,
                                PRICE_CLOSE, MODE_SIGNAL, 1); // 慢线（信号线）
 
    //--- 读取再上一根 K 线（shift=2）的 MACD 数值，用于判断金叉穿越
    double macdMainPrev2 = iMACD(Symbol(), PERIOD_M5, FastEMA, SlowEMA, SignalSMA,
-                                PRICE_CLOSE, MODE_MAIN, 2);
+                                PRICE_CLOSE, MODE_MAIN,   2);
    double macdSignPrev2 = iMACD(Symbol(), PERIOD_M5, FastEMA, SlowEMA, SignalSMA,
                                 PRICE_CLOSE, MODE_SIGNAL, 2);
 
@@ -84,7 +90,7 @@ void OnTick()
    bool hasPosition = HasOpenOrder();
 
    //========================================================================
-   //  持仓管理：用差距数组追踪截单
+   // 持仓管理：用差距数组追踪截单
    //========================================================================
    if(hasPosition)
    {
@@ -109,26 +115,63 @@ void OnTick()
       }
    }
    //========================================================================
-   //  开仓逻辑：MACD 金叉买入
+   // 开仓逻辑：MACD 金叉买入
    //========================================================================
    else
    {
       //--- 金叉条件：
-      //    (1) 快线和慢线同时在零轴以上
-      //    (2) 上上根 K 线快线 <= 慢线，上一根 K 线快线 > 慢线（从下向上穿越）
+      // (1) 快线和慢线同时在零轴以上
+      // (2) 上上根 K 线快线 <= 慢线，上一根 K 线快线 > 慢线（从下向上穿越）
       bool aboveZero = (macdMainPrev > 0 && macdSignPrev > 0);
       bool crossUp   = (macdMainPrev2 <= macdSignPrev2 && macdMainPrev > macdSignPrev);
+      //bool crossUp   = (macdMainPrev2 >= macdSignPrev2 && macdMainPrev < macdSignPrev);
 
       if(aboveZero && crossUp)
       {
+         //--- 【新增】检查之前 GAP_SIZE 根 K 线中快慢线差距为零的次数
+         //    若零差距次数 >= ZeroGapMaxCount，说明市场横盘震荡，跳过本次开仓
+         int zeroCount = CountHistoricalZeroGaps();
+         if(zeroCount >= ZeroGapMaxCount)
+         {
+            Print("金叉信号触发，但历史 ", GAP_SIZE, " 根K线中差距为零次数=", zeroCount,
+                  " >= 阈值 ", ZeroGapMaxCount, "，跳过本次开仓。");
+            return;
+         }
+
          double buyPrice = Ask;
          Print("MACD 金叉信号触发！买入价格 = ", DoubleToString(buyPrice, Digits),
-               "  快线=", DoubleToString(macdMainPrev, 6),
-               "  慢线=", DoubleToString(macdSignPrev, 6));
+               " 快线=", DoubleToString(macdMainPrev, 6),
+               " 慢线=", DoubleToString(macdSignPrev, 6),
+               " 历史零差距次数=", zeroCount, "（< 阈值 ", ZeroGapMaxCount, "，允许开仓）");
 
          OpenBuyOrder();
       }
    }
+}
+
+//+------------------------------------------------------------------+
+//| 【新增】统计历史 GAP_SIZE 根 K 线中快慢线差距为零的次数           |
+//| 直接从 iMACD 读取历史数据，不依赖 gapArray（gapArray 仅用于持仓   |
+//| 期间追踪，开仓前数组可能为空或数据不足）                           |
+//+------------------------------------------------------------------+
+int CountHistoricalZeroGaps()
+{
+   int zeroCount = 0;
+   //--- 遍历 shift=1 到 shift=GAP_SIZE（最近 GAP_SIZE 根已收盘的 K 线）
+   for(int shift = 1; shift <= GAP_SIZE; shift++)
+   {
+      double mainVal = iMACD(Symbol(), PERIOD_M5, FastEMA, SlowEMA, SignalSMA,
+                             PRICE_CLOSE, MODE_MAIN,   shift);
+      double signVal = iMACD(Symbol(), PERIOD_M5, FastEMA, SlowEMA, SignalSMA,
+                             PRICE_CLOSE, MODE_SIGNAL, shift);
+      double diff    = mainVal - signVal;
+
+      //--- 使用 NormalizeDouble 比较，消除浮点精度误差
+      //    差距绝对值小于 0.0000001 视为零
+      if(MathAbs(diff) < 0.0000001)
+         zeroCount++;
+   }
+   return(zeroCount);
 }
 
 //+------------------------------------------------------------------+
@@ -142,7 +185,7 @@ void OpenBuyOrder()
 
    //--- 价格标准化到正确的小数位数
    price = NormalizeDouble(price, Digits);
-   tp    = NormalizeDouble(tp, Digits);
+   tp    = NormalizeDouble(tp,    Digits);
 
    int ticket = OrderSend(Symbol(), OP_BUY, Lots, price, Slippage, 0, tp,
                           "MACD金叉买入", MagicNumber, 0, clrBlue);
@@ -163,7 +206,7 @@ void OpenBuyOrder()
 }
 
 //+------------------------------------------------------------------+
-//| 平掉本 EA 的 Buy 单（截单），并打印盈利                            |
+//| 平掉本 EA 的 Buy 单（截单），并打印盈利                           |
 //+------------------------------------------------------------------+
 void CloseBuyOrder()
 {
@@ -172,9 +215,9 @@ void CloseBuyOrder()
       if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
          continue;
 
-      if(OrderSymbol() == Symbol()
-         && OrderMagicNumber() == MagicNumber
-         && OrderType() == OP_BUY)
+      if(OrderSymbol()      == Symbol()
+      && OrderMagicNumber() == MagicNumber
+      && OrderType()        == OP_BUY)
       {
          double closePrice = Bid;
          closePrice = NormalizeDouble(closePrice, Digits);
@@ -195,6 +238,7 @@ void CloseBuyOrder()
             {
                Print("截单平仓成功，但读取历史盈利失败。错误=", GetLastError());
             }
+
             //--- 截单后清空差距数组
             ResetGapArray();
          }
@@ -217,9 +261,9 @@ bool HasOpenOrder()
       if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
          continue;
 
-      if(OrderSymbol() == Symbol()
-         && OrderMagicNumber() == MagicNumber
-         && OrderType() == OP_BUY)
+      if(OrderSymbol()      == Symbol()
+      && OrderMagicNumber() == MagicNumber
+      && OrderType()        == OP_BUY)
       {
          return(true);
       }
@@ -228,18 +272,18 @@ bool HasOpenOrder()
 }
 
 //+------------------------------------------------------------------+
-//| 循环数组：写入一个最新差距值                                      |
+//| 循环数组：写入一个最新差距值                                       |
 //+------------------------------------------------------------------+
 void PushGap(double gap)
 {
    gapArray[gapIndex] = gap;
-   gapIndex = (gapIndex + 1) % GAP_SIZE;   // 循环递增，写满后覆盖最旧的值
+   gapIndex = (gapIndex + 1) % GAP_SIZE; // 循环递增，写满后覆盖最旧的值
    if(gapCount < GAP_SIZE)
       gapCount++;
 }
 
 //+------------------------------------------------------------------+
-//| 循环数组：获取最新写入的差距值                                    |
+//| 循环数组：获取最新写入的差距值                                     |
 //+------------------------------------------------------------------+
 double GetLatestGap()
 {
