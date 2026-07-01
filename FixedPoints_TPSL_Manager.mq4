@@ -8,8 +8,8 @@
 #property strict
 
 //--- 固定点数参数
-input int    InpSLPoints          = 150;   // 止损点数
-input int    InpTPPoints          = 150;   // 止盈点数
+input int    InpSLPoints          = 100;   // 止损点数
+input int    InpTPPoints          = 350;   // 止盈点数
 input int    InpTrailPoints       = 50;   // 追踪止损距离(点数)，盈利追踪开始点
 input int    InpTrailStep         = 20;    // 追踪止损步进(点数)，避免频繁修改
 input int    InpBreakevenAt       = 30;    // 盈亏平衡触发点数，保盈利点
