@@ -1,30 +1,41 @@
-//+------------------------------------------------------------------+
-//|                  Martin Strategy EA (完整集成版)                |
-//|     功能：逐单移动止损、交易量判断方向、加仓、箱体限制、强平    |
+//+--------------------------------------------------------------------------------+
+//|                  Martin Strategy EA (完整集成版)                               |
+//|     功能：逐单移动止损、交易量判断方向、加仓、箱体限制、强平                   |
 //|     Version：2026-07-27 1.00.001
 //|     增加固定点数止损 ---- 27/07/2026
-//|     用参数替换趋势判断ADX的设置数值  ---- 28/07/2026 
-//+------------------------------------------------------------------+
+//|     用参数替换趋势判断ADX的设置数值。以提高对趋势行情的判断  ---- 28/07/2026 
+//|     启用新的方向判断函数      ---- 29/07/2026
+//+--------------------------------------------------------------------------------+
 
 #property strict
 #include <GeneralFunctions.mqh>
-extern double LotSize = 0.02;
+extern double LotSize = 0.05;
 extern int GridStepPoints = 200;      // 加仓点数
 extern int MaxOrders = 10;            // 最多加仓次数
 extern int BoxBars = 600;             // 箱体周期
 extern int MagicNumber = 5301001;      // 仅管理本策略订单
-extern double TrailStart = 100;
+extern double TrailStart = 75;
 double singal_trade_risk_rate = 0.975;
 
 extern int MaxLongOrders = 2;        // 多单上限
 extern int MaxShortOrders = 2;       // 空单上限
 
-//固定止损参数
+// =====  固定止损参数  ===== 
 extern bool EnableTrendFixedStop = true;   // 启用趋势固定点数止损
 extern int  TrendStopLossPoints = 400;     // 进入趋势后，单笔亏损达到多少点止损
 
-extern int    ADXPeriod = 48;          // ADX周期
+// ===== 趋势行情判断参数  ===== 
+extern int    ADXPeriod = 34;          // ADX周期
 extern double ADXThreshold = 20.0;     // ADX趋势阈值
+
+// ===== 首单方向判断参数 =====
+extern int    EntryLookbackBars = 600;       // 首单箱体回看K线数
+extern double BoxEdgePercent = 0.20;         // 顶部/底部区域比例，0.20 = 20%
+
+extern bool   RequireReversalBar = true;     // 要求K线反转确认：底部阳线 / 顶部阴线
+extern bool   RequireFalseBreak = true;      // 要求假突破回归箱体后才开仓
+extern double MinReversalBodyPercent = 0.30; // 最小实体占K线总长度比例，0.30 = 30%
+
 
 
 string MTag(){ return StringConcatenate("[Magic:", MagicNumber, "] "); }
@@ -444,41 +455,159 @@ bool IsTrending()
 }
 
 // 判断当前价格是否处于箱体顶部/底部区域
-int GetBoxPositionDirection(string symbol = NULL, int lookbackBars = 100) {
-    if (symbol == NULL) symbol = Symbol();
+//+------------------------------------------------------------------+
+//| 根据已收盘K线判断箱体顶部/底部的反转开仓方向                     |
+//| 返回：OP_BUY / OP_SELL / 0（不交易）                            |
+//+------------------------------------------------------------------+
+int GetBoxPositionDirection()
+{
+   // 至少需要：回看周期 + 当前K线 + 已收盘信号K线
+   if(Bars < EntryLookbackBars + 2)
+   {
+      Print(MTag(), "K线数量不足，无法判断首单方向。Bars=", Bars,
+            " 需要至少=", EntryLookbackBars + 2);
+      return 0;
+   }
 
-    int totalBars = Bars;
-    if (lookbackBars > totalBars - 1) {
-        lookbackBars = totalBars - 1;  // 避免越界
-    }
+   // 参数保护
+   int lookbackBars = EntryLookbackBars;
+   if(lookbackBars < 10)
+      lookbackBars = 10;
 
-    double boxHigh = High[1];
-    double boxLow = Low[1];
+   double edgePercent = BoxEdgePercent;
+   if(edgePercent <= 0.0 || edgePercent >= 0.5)
+   {
+      Print(MTag(), "BoxEdgePercent 参数无效，自动使用 0.20");
+      edgePercent = 0.20;
+   }
 
-    for (int i = 1; i <= lookbackBars; i++) {
-        if (High[i] > boxHigh) boxHigh = High[i];
-        if (Low[i] < boxLow) boxLow = Low[i];
-    }
+   double minBodyPercent = MinReversalBodyPercent;
+   if(minBodyPercent < 0.0)
+      minBodyPercent = 0.0;
+   if(minBodyPercent > 1.0)
+      minBodyPercent = 1.0;
 
-    double range = boxHigh - boxLow;
-    if (range <= 0) return -1;
+   // 只统计过去已完成的K线：从 K[2] 开始，
+   // 避免把作为信号的 K[1] 本身计入箱体边界，降低“自己定义自己”的问题
+   int highShift = iHighest(NULL, 0, MODE_HIGH, lookbackBars, 2);
+   int lowShift  = iLowest(NULL, 0, MODE_LOW, lookbackBars, 2);
 
-    double topZone = boxHigh - 0.2 * range;
-    double bottomZone = boxLow + 0.2 * range;
-    double currentPrice = (Ask + Bid)/2.0;
+   if(highShift < 0 || lowShift < 0)
+   {
+      Print(MTag(), "无法取得箱体高低点。");
+      return 0;
+   }
 
-    if (currentPrice >= topZone) {
-        Print(MTag(), "方向判定=空 | 价格=", F5(currentPrice), " 顶部阈=", F5(topZone), " 底部阈=", F5(bottomZone), " 区间顶=", F5(boxHigh), " 区间底=", F5(boxLow));
-        return OP_SELL; // 顶部区域 → 做空
-    }
+   double boxHigh = High[highShift];
+   double boxLow  = Low[lowShift];
+   double range   = boxHigh - boxLow;
 
-    if (currentPrice <= bottomZone) {
-        Print(MTag(), "方向判定=多 | 价格=", F5(currentPrice), " 顶部阈=", F5(topZone), " 底部阈=", F5(bottomZone), " 区间顶=", F5(boxHigh), " 区间底=", F5(boxLow));
-        return OP_BUY; // 底部区域 → 做多
-    }
+   if(range <= 0.0)
+   {
+      Print(MTag(), "箱体区间无效，区间高度=", F5(range));
+      return 0;
+   }
 
-    Print(MTag(), "方向判定=不确定,区间高度:",F5(range));
-    return 0; // 中间区域
+   // 顶部20%与底部20%
+   double topZone    = boxHigh - range * edgePercent;
+   double bottomZone = boxLow  + range * edgePercent;
+
+   // 只读取已经收盘的上一根K线
+   double signalOpen  = Open[1];
+   double signalHigh  = High[1];
+   double signalLow   = Low[1];
+   double signalClose = Close[1];
+
+   double candleRange = signalHigh - signalLow;
+   if(candleRange <= 0.0)
+   {
+      Print(MTag(), "信号K线无有效波幅，不开仓。");
+      return 0;
+   }
+
+   double candleBody = MathAbs(signalClose - signalOpen);
+   double bodyRatio  = candleBody / candleRange;
+
+   bool bullBar = (signalClose > signalOpen);
+   bool bearBar = (signalClose < signalOpen);
+
+   // 触及底部 / 顶部区域
+   bool touchedBottom = (signalLow <= bottomZone);
+   bool touchedTop    = (signalHigh >= topZone);
+
+   // 假跌破：低点跌入或跌破底部区域，但收盘重新回到其上方
+   bool buyFalseBreak = (signalLow <= bottomZone &&
+                         signalClose > bottomZone);
+
+   // 假突破：高点进入或突破顶部区域，但收盘重新回到其下方
+   bool sellFalseBreak = (signalHigh >= topZone &&
+                          signalClose < topZone);
+
+   // 若关闭假突破要求，只要K线触及边缘区域即可；
+   // 若开启，则必须满足“刺破/触及后收回”的条件。
+   bool buyLocationOK = RequireFalseBreak ? buyFalseBreak : touchedBottom;
+   bool sellLocationOK = RequireFalseBreak ? sellFalseBreak : touchedTop;
+
+   // 反转K线开关：开启后，底部只接受阳线、顶部只接受阴线
+   bool buyCandleOK = !RequireReversalBar || bullBar;
+   bool sellCandleOK = !RequireReversalBar || bearBar;
+
+   // 实体过滤：若阈值为0，则不限制实体比例
+   bool bodyOK = (bodyRatio >= minBodyPercent);
+
+   // ===== 底部反转 -> 做多 =====
+   if(buyLocationOK && buyCandleOK && bodyOK)
+   {
+      Print(MTag(),
+            "方向判定=多 | 底部反转确认",
+            " 箱体顶=", F5(boxHigh),
+            " 箱体底=", F5(boxLow),
+            " 底部阈=", F5(bottomZone),
+            " K[1] O=", F5(signalOpen),
+            " H=", F5(signalHigh),
+            " L=", F5(signalLow),
+            " C=", F5(signalClose),
+            " 实体比例=", DoubleToString(bodyRatio * 100.0, 1), "%",
+            " 假跌破=", (buyFalseBreak ? "是" : "否"));
+
+      return OP_BUY;
+   }
+
+   // ===== 顶部反转 -> 做空 =====
+   if(sellLocationOK && sellCandleOK && bodyOK)
+   {
+      Print(MTag(),
+            "方向判定=空 | 顶部反转确认",
+            " 箱体顶=", F5(boxHigh),
+            " 箱体底=", F5(boxLow),
+            " 顶部阈=", F5(topZone),
+            " K[1] O=", F5(signalOpen),
+            " H=", F5(signalHigh),
+            " L=", F5(signalLow),
+            " C=", F5(signalClose),
+            " 实体比例=", DoubleToString(bodyRatio * 100.0, 1), "%",
+            " 假突破=", (sellFalseBreak ? "是" : "否"));
+
+      return OP_SELL;
+   }
+
+   Print(MTag(),
+         "方向判定=不交易",
+         " | 箱体顶=", F5(boxHigh),
+         " 箱体底=", F5(boxLow),
+         " 顶阈=", F5(topZone),
+         " 底阈=", F5(bottomZone),
+         " | K[1] O=", F5(signalOpen),
+         " H=", F5(signalHigh),
+         " L=", F5(signalLow),
+         " C=", F5(signalClose),
+         " 实体比例=", DoubleToString(bodyRatio * 100.0, 1), "%",
+         " | 底部触及=", (touchedBottom ? "是" : "否"),
+         " 顶部触及=", (touchedTop ? "是" : "否"),
+         " 假跌破=", (buyFalseBreak ? "是" : "否"),
+         " 假突破=", (sellFalseBreak ? "是" : "否"));
+
+   return 0;
 }
 
 //固定止损函数
