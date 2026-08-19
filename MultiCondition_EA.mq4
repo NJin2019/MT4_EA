@@ -1,544 +1,264 @@
 //+------------------------------------------------------------------+
 //|  MultiCondition_EA.mq4                                            |
-//|  多条件开仓策略：MACD + KDJ + Bollinger Bands                      |
-//|  不设初始SL/TP，由 TPSL_Manager.mqh 接管管理                        |
+//|  纯J线反转追踪: J谷→做多  J峰→做空  反转即平仓反手                |
+//|  最多1单常持, 不设SL/TP, 靠下一个J反转自然离场                    |
 //+------------------------------------------------------------------+
 #property copyright "NJin"
-#property version   "1.11"
+#property version   "2.30"
 #property strict
 
-#include <TPSL_Manager.mqh>
-
 //+------------------------------------------------------------------+
-//| 参数分类                                                           |
+//| 参数                                                               |
 //+------------------------------------------------------------------+
-//--- [1] 交易基础参数
-input double InpLotSize        = 0.05;   // 开仓手数
+//--- [1] 交易基础
+input double InpLotSize        = 0.01;   // 开仓手数
 input int    InpMagicNumber    = 240801; // Magic Number
 input int    InpSlippage       = 30;     // 滑点(点数)
-input int    InpMaxPositions   = 1;      // 最大总持仓数
+input int    InpMaxLong        = 1;      // 最大多单数
+input int    InpMaxShort       = 1;      // 最大空单数
 
-//--- [2] MACD 参数
-input int    InpMACDFast       = 8;      // MACD 快线周期
-input int    InpMACDSlow       = 17;     // MACD 慢线周期
-input int    InpMACDSignal     = 9;      // MACD 信号线周期
+//--- [2] KDJ (用于计算J线)
+input int    InpKDJK           = 9;      // K周期
+input int    InpKDJD           = 3;      // D周期
+input int    InpKDJSlowing     = 3;      // 慢速
 
-//--- [3] KDJ (Stochastic) 参数
-input int    InpKDJK           = 9;      // KDJ K周期
-input int    InpKDJD           = 3;      // KDJ D周期
-input int    InpKDJSlowing     = 3;      // KDJ 慢速
-input int    InpKDJLookback    = 4;      // KDJ交叉回溯K线数(参考范围)
+//--- [3] J线反转参数
+input double InpMinReversal    = 15.0;   // 最小反转幅度(J点数, 过滤小波动)
+input double InpConfirmPoints   = 5.0;    // 确认点数(j0需超出j1此点数才算确认反转)
 
-//--- [4] 布林带参数
+//--- [4] 趋势过滤(EMA)
+input bool   InpUseEMAFilter   = true;   // 用EMA趋势过滤方向
+input int    InpEMAPeriod      = 50;     // EMA周期
+
+//--- [5] 布林带过滤
+input bool   InpUseBollFilter  = false;  // 用布林带方向过滤
 input int    InpBollPeriod     = 20;     // 布林带周期
 input double InpBollDeviation  = 2.0;    // 布林带偏差
-input int    InpBollShift      = 0;      // 布林带偏移
 
-//--- [5] 止盈止损参数（传给 TPSL_Manager）
-input int    InpSLPoints       = 100;    // 止损点数
-input int    InpTPPoints       = 350;    // 止盈点数
-input int    InpTrailPoints    = 50;     // 追踪止损距离(点数)
-input int    InpTrailStep      = 20;     // 追踪止损步进(点数)
-input int    InpBreakevenAt    = 30;     // 盈亏平衡触发点数
-input int    InpBreakevenAdd   = 10;     // 盈亏平衡后锁定额外点数
-input bool   InpUseTrailing    = true;   // 启用追踪止损
-input bool   InpUseBreakeven   = true;   // 启用盈亏平衡
+//--- [6] 风控
+input double InpMaxSpread      = 30;     // 最大点差
 
-//--- [6] 功能开关
-input bool   InpAllowLong      = true;   // 允许多仓
-input bool   InpAllowShort     = true;   // 允许空仓
-input double InpMaxSpread      = 30;     // 最大允许点差(超过不交易)
-input bool   InpDebugMode      = true;   // 调试模式(输出每根K线各条件详细数值)
+//--- [7] 调试
+input bool   InpDebugMode      = true;   // 调试模式
 
 //+------------------------------------------------------------------+
 //| 全局                                                               |
 //+------------------------------------------------------------------+
 datetime g_last_bar_time = 0;
+bool     g_traded_this_bar = false;    // 本根K线是否已交易过
 
 //+------------------------------------------------------------------+
 int OnInit()
 {
    Print("╔══════════════════════════════════════╗");
-   Print("║  多条件开仓EA v1.11 已启动            ║");
+   Print("║  J线反转追踪 v2.30 已启动             ║");
    Print("╚══════════════════════════════════════╝");
-   Print("MACD(", InpMACDFast, ",", InpMACDSlow, ",", InpMACDSignal, ")");
-   Print("KDJ(", InpKDJK, ",", InpKDJD, ",", InpKDJSlowing, ")  回溯:", InpKDJLookback, "K线");
-   Print("Boll(", InpBollPeriod, ",", InpBollDeviation, ")");
-   Print("手数:", InpLotSize, "  |  最大持仓:", InpMaxPositions);
-   Print("止损:", InpSLPoints, "pts  |  止盈:", InpTPPoints, "pts");
-   Print("追踪:", InpTrailPoints, "pts  |  步进:", InpTrailStep, "pts");
-   Print("保本触发:", InpBreakevenAt, "pts  |  保本锁利:", InpBreakevenAdd, "pts");
-   if(!InpAllowLong)  Print("*** 多仓已禁用 ***");
-   if(!InpAllowShort) Print("*** 空仓已禁用 ***");
+   Print("KDJ(", InpKDJK, ",", InpKDJD, ",", InpKDJSlowing, ")  反转幅度≥", InpMinReversal, "  确认≥", InpConfirmPoints);
+   Print("EMA趋势过滤:", InpUseEMAFilter ? "ON" : "OFF", "  周期:", InpEMAPeriod);
+   Print("持仓上限: 多", InpMaxLong, "单  空", InpMaxShort, "单");
+   Print("布林过滤:", InpUseBollFilter ? "ON" : "OFF", "  (", InpBollPeriod, ",", InpBollDeviation, ")");
+   Print("手数:", InpLotSize, "  |  不设SL/TP, 反转即离场");
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   string reason_text = "";
-   switch(reason)
-   {
-      case 0:  reason_text = "脚本正常结束(0)";             break;
-      case 1:  reason_text = "EA被手动移除图表(REASON_REMOVE)";       break;
-      case 2:  reason_text = "EA被重新编译(REASON_RECOMPILE)";       break;
-      case 3:  reason_text = "品种或周期变更(REASON_CHARTCHANGE)";    break;
-      case 4:  reason_text = "图表被关闭(REASON_CHARTCLOSE)";        break;
-      case 5:  reason_text = "输入参数被修改(REASON_PARAMETERS)";     break;
-      case 6:  reason_text = "账户变更(REASON_ACCOUNT)";             break;
-      case 7:  reason_text = "模板操作导致(REASON_TEMPLATE)";         break;
-      case 8:  reason_text = "初始化失败(REASON_INITFAILED)";         break;
-      case 9:  reason_text = "终端关闭(REASON_CLOSE)";               break;
-      default: reason_text = "未知原因";
-   }
-   Print("╔══════════════════════════════════════╗");
-   Print("║  多条件开仓EA 已停止                   ║");
-   Print("║  原因: ", reason_text);
-   Print("║  代码: ", reason);
-   Print("╚══════════════════════════════════════╝");
+   Print("J线反转追踪 EA 已停止, 代码:", reason);
 }
 
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   //--- 0. 数据充足性检查（避免指标调用时数据不足导致异常）
-   int min_bars = InpBollPeriod + InpMACDSlow + InpKDJK + InpKDJLookback + 50;
-   if(Bars < min_bars)
-   {
-      if(InpDebugMode)
-         Print("[等待数据] 当前K线数=", Bars, " / 需要≥", min_bars);
-      return;
-   }
+   //--- 点差过滤
+   if(MarketInfo(_Symbol, MODE_SPREAD) > InpMaxSpread) return;
 
-   //--- 1. 点差过滤
-   double current_spread = MarketInfo(_Symbol, MODE_SPREAD);
-   if(current_spread > InpMaxSpread)
-   {
-      if(InpDebugMode)
-      {
-         // 每 60 秒最多打印一次，避免刷屏
-         static datetime last_spread_warn = 0;
-         if(TimeCurrent() - last_spread_warn >= 60)
-         {
-            Print("[点差过大] 当前=", current_spread, "pts  >  允许最大=", InpMaxSpread, "pts  → 跳过本Tick");
-            last_spread_warn = TimeCurrent();
-         }
-      }
-      return;
-   }
-   // 打印点差正常（仅在新K线时，减少刷屏）
-   static datetime last_spread_ok = 0;
-   if(InpDebugMode && Time[0] != last_spread_ok)
-   {
-      last_spread_ok = Time[0];
-      Print("[点差正常] 当前=", current_spread, "pts  ≤  允许最大=", InpMaxSpread, "pts");
-   }
-
-   //--- 2. 检测新K线
-   bool is_new_bar = false;
+   //--- 新K线检测(重置本根K线交易标志)
    if(Time[0] != g_last_bar_time)
    {
       g_last_bar_time = Time[0];
-      is_new_bar = true;
+      g_traded_this_bar = false;
    }
 
-   //--- 3. 只在有新K线时检查开仓信号
-   if(is_new_bar)
+   //--- 每Tick检查J线反转(已交易过本K线则跳过)
+   if(g_traded_this_bar) return;
+
+   double k2, d2, k1, d1, k0, d0;
+   double j2 = JValue(2, k2, d2);     // bar[2] 已闭合,不变
+   double j1 = JValue(1, k1, d1);     // bar[1] 已闭合,不变
+   double j0 = JValue(0, k0, d0);     // bar[0] 随Tick变化
+
+   double diff_12 = j1 - j2;           // bar[1]相对于bar[2]的变动(不变)
+   double diff_01 = j0 - j1;           // bar[0]相对于bar[1]的变动(每Tick变)
+
+   // J谷形态(多): bar[2] > bar[1], 且 bar[0]已从bar[1]回升确认点数
+   bool valley = (j2 > j1 && diff_01 >= InpConfirmPoints && MathAbs(diff_12) >= InpMinReversal);
+   // J峰形态(空): bar[2] < bar[1], 且 bar[0]已从bar[1]回落确认点数
+   bool peak   = (j2 < j1 && -diff_01 >= InpConfirmPoints && MathAbs(diff_12) >= InpMinReversal);
+
+   if(InpDebugMode && (valley || peak))
    {
-      if(InpDebugMode)
-         DebugPrintBarHeader();
-
-      int long_count = 0, short_count = 0;
-      CountPositions(long_count, short_count);
-      int total = long_count + short_count;
-
-      if(total < InpMaxPositions)
-      {
-         // 空单信号
-         if(InpAllowShort && short_count == 0 && CheckShortSignal())
-         {
-            OpenShort();
-            // 重新统计（刚开了仓）
-            CountPositions(long_count, short_count);
-            total = long_count + short_count;
-         }
-
-         // 多单信号
-         if(InpAllowLong && long_count == 0 && total < InpMaxPositions && CheckLongSignal())
-         {
-            OpenLong();
-         }
-      }
+      Print("╔══ [", TimeToStr(TimeCurrent(), TIME_DATE|TIME_MINUTES), "] ═══════════════════════");
+      Print("║ J值: bar[2]=", DoubleToStr(j2, 1), "  bar[1]=", DoubleToStr(j1, 1), "  bar[0]=", DoubleToStr(j0, 1));
+      Print("║ Δ(1-2)=", DoubleToStr(diff_12, 1), " [阈值", InpMinReversal, "]  Δ(0-1)=", DoubleToStr(diff_01, 1), " [确认", InpConfirmPoints, "]");
+      if(valley) Print("║ → J谷反转 触发做多");
+      if(peak)   Print("║ → J峰反转 触发做空");
    }
 
-   //--- 4. 每Tick管理止损止盈
-   ManageAllTPSL(
-      _Symbol,
-      InpMagicNumber,
-      InpSLPoints,
-      InpTPPoints,
-      InpTrailPoints,
-      InpTrailStep,
-      InpBreakevenAt,
-      InpBreakevenAdd,
-      InpUseTrailing,
-      InpUseBreakeven,
-      true,    // fix_missing_tpsl
-      false,   // overwrite_existing_sl
-      false    // overwrite_existing_tp
-   );
-}
+   if(!valley && !peak) return;
 
-//+------------------------------------------------------------------+
-//| Debug: 打印新K线信息头                                              |
-//+------------------------------------------------------------------+
-void DebugPrintBarHeader()
-{
-   double point  = MarketInfo(_Symbol, MODE_POINT);
-   if(point <= 0) return;  // 除零保护
+   g_traded_this_bar = true;   // 本K线已处理,不再重复触发
 
-   int    digits = (int)MarketInfo(_Symbol, MODE_DIGITS);
-   double bid    = MarketInfo(_Symbol, MODE_BID);
-   double ask    = MarketInfo(_Symbol, MODE_ASK);
-   double spread = MarketInfo(_Symbol, MODE_SPREAD);
-   int    count  = CountTotalPositions();
-
-   Print("");
-   Print("╔══════════════════════════════════════════════════════╗");
-   Print("║ [新K线] ", TimeToStr(Time[0], TIME_DATE|TIME_MINUTES),
-         "  Bid=", DoubleToStr(bid, digits),
-         "  Ask=", DoubleToStr(ask, digits),
-         "  点差=", DoubleToStr(spread, 0));
-   Print("║ 当前持仓=", count, "/", InpMaxPositions,
-         "  |  调试模式=ON");
-   Print("╚══════════════════════════════════════════════════════╝");
-}
-
-//+------------------------------------------------------------------+
-//| 统计总持仓数                                                        |
-//+------------------------------------------------------------------+
-int CountTotalPositions()
-{
-   int total = 0;
-   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   //--- 统计当前持仓
+   int long_count = 0, short_count = 0;
+   int long_tickets[], short_tickets[];
+   ArrayResize(long_tickets, 0);
+   ArrayResize(short_tickets, 0);
+   int i;
+   for(i = OrdersTotal() - 1; i >= 0; i--)
    {
       if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
-      if(OrderSymbol()     != _Symbol)          continue;
-      if(OrderMagicNumber() != InpMagicNumber)   continue;
-      total++;
+      if(OrderSymbol()     != _Symbol)        continue;
+      if(OrderMagicNumber() != InpMagicNumber) continue;
+      if(OrderType() == OP_BUY)
+         { long_count++; int s = ArraySize(long_tickets); ArrayResize(long_tickets, s+1); long_tickets[s] = OrderTicket(); }
+      else if(OrderType() == OP_SELL)
+         { short_count++; int s = ArraySize(short_tickets); ArrayResize(short_tickets, s+1); short_tickets[s] = OrderTicket(); }
    }
-   return total;
-}
 
-//+------------------------------------------------------------------+
-//| 统计持仓数量（按方向）                                              |
-//+------------------------------------------------------------------+
-void CountPositions(int &long_count, int &short_count)
-{
-   long_count  = 0;
-   short_count = 0;
-   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   //===== 阶段1: J拐点即平仓 =====
+   if(valley)
+   {
+      for(i = ArraySize(short_tickets) - 1; i >= 0; i--)
+         ClosePosition(short_tickets[i], "J谷平空");
+   }
+   else if(peak)
+   {
+      for(i = ArraySize(long_tickets) - 1; i >= 0; i--)
+         ClosePosition(long_tickets[i], "J峰平多");
+   }
+
+   //===== 阶段2: 满足条件开仓 =====
+   // 重新统计
+   long_count = 0; short_count = 0;
+   for(i = OrdersTotal() - 1; i >= 0; i--)
    {
       if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
-      if(OrderSymbol()     != _Symbol)          continue;
-      if(OrderMagicNumber() != InpMagicNumber)   continue;
-
-      if(OrderType() == OP_BUY)       long_count++;
+      if(OrderSymbol()     != _Symbol)        continue;
+      if(OrderMagicNumber() != InpMagicNumber) continue;
+      if(OrderType() == OP_BUY) long_count++;
       else if(OrderType() == OP_SELL) short_count++;
    }
-}
 
-//+==================================================================+
-//|                     空单信号检查 (含 Debug)                        |
-//+==================================================================+
-bool CheckShortSignal()
-{
-   if(InpDebugMode)
+   bool can_open_long  = valley && long_count < InpMaxLong;
+   bool can_open_short = peak   && short_count < InpMaxShort;
+
+   // 布林带方向过滤
+   if(InpUseBollFilter && (can_open_long || can_open_short))
    {
-      Print("  ┌─ [空单检查 SELL] ───────────────────────────────");
+      double mid = iBands(_Symbol, 0, InpBollPeriod, InpBollDeviation,
+                          0, PRICE_CLOSE, MODE_MAIN, 1);
+      double bid = MarketInfo(_Symbol, MODE_BID);
+      if(can_open_long && bid > mid)
+      {
+         if(InpDebugMode) Print("║ 做多被过滤: Bid>Mid");
+         can_open_long = false;
+      }
+      if(can_open_short && bid < mid)
+      {
+         if(InpDebugMode) Print("║ 做空被过滤: Bid<Mid");
+         can_open_short = false;
+      }
    }
 
-   //--- 条件1: MACD(8,17,9) 死叉 + 零线上方
-   bool c1 = MACDDeadCrossAboveZero();
-   if(InpDebugMode) Print("  │  条件1-MACD死叉+零线上方: ", c1 ? "✅ 通过" : "❌ 未通过");
-   if(!c1) { if(InpDebugMode) Print("  └─ 空单: 条件1不满足，跳过 ─"); return false; }
-
-   //--- 条件2: 过去N根K线内，KDJ(9,3,3) 死叉 + 75线上方
-   bool c2 = KDJDeadCrossAbove(75.0);
-   if(InpDebugMode) Print("  │  条件2-KDJ死叉+75线上方: ", c2 ? "✅ 通过" : "❌ 未通过");
-   if(!c2) { if(InpDebugMode) Print("  └─ 空单: 条件2不满足，跳过 ─"); return false; }
-
-   //--- 条件3: Bid > 布林带中轨
-   double mid = iBands(_Symbol, 0, InpBollPeriod, InpBollDeviation,
-                       InpBollShift, PRICE_CLOSE, MODE_MAIN, 1);
-   double bid = MarketInfo(_Symbol, MODE_BID);
-   bool c3 = (bid > mid);
-   if(InpDebugMode)
+   // 趋势过滤(EMA)
+   if(InpUseEMAFilter && (can_open_long || can_open_short))
    {
-      int d = (int)MarketInfo(_Symbol, MODE_DIGITS);
-      Print("  │  条件3-Bid>Boll中轨: ", c3 ? "✅ 通过" : "❌ 未通过",
-            "  Bid=", DoubleToStr(bid, d),
-            "  Mid=", DoubleToStr(mid, d),
-            "  差值=", DoubleToStr((bid - mid) / MarketInfo(_Symbol, MODE_POINT), 1), "pts");
-   }
-   if(!c3) { if(InpDebugMode) Print("  └─ 空单: 条件3不满足，跳过 ─"); return false; }
-
-   if(InpDebugMode) Print("  └─ 空单: ✅ 三条件全部满足! ──────────────");
-   return true;
-}
-
-//+==================================================================+
-//|                     多单信号检查 (含 Debug)                        |
-//+==================================================================+
-bool CheckLongSignal()
-{
-   if(InpDebugMode)
-   {
-      Print("  ┌─ [多单检查 BUY] ────────────────────────────────");
-   }
-
-   //--- 条件1: MACD(8,17,9) 金叉 + 零线下方
-   bool c1 = MACDGoldenCrossBelowZero();
-   if(InpDebugMode) Print("  │  条件1-MACD金叉+零线下方: ", c1 ? "✅ 通过" : "❌ 未通过");
-   if(!c1) { if(InpDebugMode) Print("  └─ 多单: 条件1不满足，跳过 ─"); return false; }
-
-   //--- 条件2: 过去N根K线内，KDJ(9,3,3) 金叉 + 50线下方
-   bool c2 = KDJGoldenCrossBelow(50.0);
-   if(InpDebugMode) Print("  │  条件2-KDJ金叉+50线下方: ", c2 ? "✅ 通过" : "❌ 未通过");
-   if(!c2) { if(InpDebugMode) Print("  └─ 多单: 条件2不满足，跳过 ─"); return false; }
-
-   //--- 条件3: Bid < 布林带中轨
-   double mid = iBands(_Symbol, 0, InpBollPeriod, InpBollDeviation,
-                       InpBollShift, PRICE_CLOSE, MODE_MAIN, 1);
-   double bid = MarketInfo(_Symbol, MODE_BID);
-   bool c3 = (bid < mid);
-   if(InpDebugMode)
-   {
-      int d = (int)MarketInfo(_Symbol, MODE_DIGITS);
-      Print("  │  条件3-Bid<Boll中轨: ", c3 ? "✅ 通过" : "❌ 未通过",
-            "  Bid=", DoubleToStr(bid, d),
-            "  Mid=", DoubleToStr(mid, d),
-            "  差值=", DoubleToStr((bid - mid) / MarketInfo(_Symbol, MODE_POINT), 1), "pts");
-   }
-   if(!c3) { if(InpDebugMode) Print("  └─ 多单: 条件3不满足，跳过 ─"); return false; }
-
-   if(InpDebugMode) Print("  └─ 多单: ✅ 三条件全部满足! ──────────────");
-   return true;
-}
-
-//+==================================================================+
-//| MACD 死叉 + 在零线上方（空单用） [Debug版]                           |
-//+==================================================================+
-bool MACDDeadCrossAboveZero()
-{
-   if(InpDebugMode) Print("  │    [MACD(8,17,9) 死叉+零线上方]");
-
-   bool found = false;
-   for(int shift = 0; shift <= 1; shift++)
-   {
-      double main_prev = iMACD(_Symbol, 0, InpMACDFast, InpMACDSlow, InpMACDSignal,
-                               PRICE_CLOSE, MODE_MAIN, shift + 1);
-      double sig_prev  = iMACD(_Symbol, 0, InpMACDFast, InpMACDSlow, InpMACDSignal,
-                               PRICE_CLOSE, MODE_SIGNAL, shift + 1);
-      double main_curr = iMACD(_Symbol, 0, InpMACDFast, InpMACDSlow, InpMACDSignal,
-                               PRICE_CLOSE, MODE_MAIN, shift);
-      double sig_curr  = iMACD(_Symbol, 0, InpMACDFast, InpMACDSlow, InpMACDSignal,
-                               PRICE_CLOSE, MODE_SIGNAL, shift);
-
-      // 死叉: 前一根 main > sig, 当前 main < sig, 且 main_curr > 0
-      bool is_dead = (main_prev > sig_prev && main_curr < sig_curr);
-      bool above_zero = (main_curr > 0);
+      double ema1 = iMA(_Symbol, 0, InpEMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 1);
+      double ema5 = iMA(_Symbol, 0, InpEMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 5);
+      bool trend_up   = (ema1 > ema5);    // EMA上升
+      bool trend_down = (ema1 < ema5);    // EMA下降
 
       if(InpDebugMode)
+         Print("║ EMA趋势: ema[1]=", DoubleToStr(ema1, 5), "  ema[5]=", DoubleToStr(ema5, 5),
+               "  → ", trend_up ? "上升(只做多)" : (trend_down ? "下降(只做空)" : "横盘"));
+
+      if(can_open_long && trend_down)
       {
-         Print("  │      bar[", shift + 1, "]->bar[", shift, "]: ",
-               "main(", DoubleToStr(main_prev, 6), "->", DoubleToStr(main_curr, 6), ") ",
-               "sig(", DoubleToStr(sig_prev, 6), "->", DoubleToStr(sig_curr, 6), ") ",
-               "│ 死叉?", is_dead ? "YES" : "NO",
-               "  main>0?", above_zero ? "YES" : "NO",
-               "  => ", (is_dead && above_zero) ? "✅" : "✗");
+         if(InpDebugMode) Print("║ 做多被EMA过滤: 趋势向下");
+         can_open_long = false;
       }
-
-      if(is_dead && above_zero)
+      if(can_open_short && trend_up)
       {
-         found = true;
-         break;
-      }
-   }
-   return found;
-}
-
-//+==================================================================+
-//| MACD 金叉 + 在零线下方（多单用） [Debug版]                           |
-//+==================================================================+
-bool MACDGoldenCrossBelowZero()
-{
-   if(InpDebugMode) Print("  │    [MACD(8,17,9) 金叉+零线下方]");
-
-   bool found = false;
-   for(int shift = 0; shift <= 1; shift++)
-   {
-      double main_prev = iMACD(_Symbol, 0, InpMACDFast, InpMACDSlow, InpMACDSignal,
-                               PRICE_CLOSE, MODE_MAIN, shift + 1);
-      double sig_prev  = iMACD(_Symbol, 0, InpMACDFast, InpMACDSlow, InpMACDSignal,
-                               PRICE_CLOSE, MODE_SIGNAL, shift + 1);
-      double main_curr = iMACD(_Symbol, 0, InpMACDFast, InpMACDSlow, InpMACDSignal,
-                               PRICE_CLOSE, MODE_MAIN, shift);
-      double sig_curr  = iMACD(_Symbol, 0, InpMACDFast, InpMACDSlow, InpMACDSignal,
-                               PRICE_CLOSE, MODE_SIGNAL, shift);
-
-      // 金叉: 前一根 main < sig, 当前 main > sig, 且 main_curr < 0
-      bool is_golden = (main_prev < sig_prev && main_curr > sig_curr);
-      bool below_zero = (main_curr < 0);
-
-      if(InpDebugMode)
-      {
-         Print("  │      bar[", shift + 1, "]->bar[", shift, "]: ",
-               "main(", DoubleToStr(main_prev, 6), "->", DoubleToStr(main_curr, 6), ") ",
-               "sig(", DoubleToStr(sig_prev, 6), "->", DoubleToStr(sig_curr, 6), ") ",
-               "│ 金叉?", is_golden ? "YES" : "NO",
-               "  main<0?", below_zero ? "YES" : "NO",
-               "  => ", (is_golden && below_zero) ? "✅" : "✗");
-      }
-
-      if(is_golden && below_zero)
-      {
-         found = true;
-         break;
+         if(InpDebugMode) Print("║ 做空被EMA过滤: 趋势向上");
+         can_open_short = false;
       }
    }
-   return found;
+
+   if(can_open_long)  OpenLong();
+   if(can_open_short) OpenShort();
 }
 
-//+==================================================================+
-//| KDJ 死叉检测（在过去 lookback 根K线内） + 在 level 线上方 [Debug版] |
-//+==================================================================+
-bool KDJDeadCrossAbove(double level)
+//+------------------------------------------------------------------+
+//| 获取 J 线值及 K/D  J = 3*K - 2*D                                   |
+//+------------------------------------------------------------------+
+double JValue(int bar, double &k_val, double &d_val)
 {
-   if(InpDebugMode)
-      Print("  │    [KDJ(9,3,3) 死叉+J>", level, " 回溯", InpKDJLookback, "根]");
-
-   for(int i = 1; i <= InpKDJLookback; i++)
-   {
-      double k_prev = iStochastic(_Symbol, 0, InpKDJK, InpKDJD, InpKDJSlowing,
-                                  MODE_SMA, 0, MODE_MAIN, i + 1);
-      double d_prev = iStochastic(_Symbol, 0, InpKDJK, InpKDJD, InpKDJSlowing,
-                                  MODE_SMA, 0, MODE_SIGNAL, i + 1);
-      double k_curr = iStochastic(_Symbol, 0, InpKDJK, InpKDJD, InpKDJSlowing,
-                                  MODE_SMA, 0, MODE_MAIN, i);
-      double d_curr = iStochastic(_Symbol, 0, InpKDJK, InpKDJD, InpKDJSlowing,
-                                  MODE_SMA, 0, MODE_SIGNAL, i);
-
-      double j_prev = 3.0 * k_prev - 2.0 * d_prev;
-
-      // 死叉: 前一根 K > D  →  当前 K < D
-      bool is_dead = (k_prev > d_prev && k_curr < d_curr);
-      bool above_level = (j_prev > level);
-
-      if(InpDebugMode)
-      {
-         Print("  │      bar[", i + 1, "]->bar[", i, "]: ",
-               "K(", DoubleToStr(k_prev, 1), "->", DoubleToStr(k_curr, 1), ") ",
-               "D(", DoubleToStr(d_prev, 1), "->", DoubleToStr(d_curr, 1), ") ",
-               "J(prev)=", DoubleToStr(j_prev, 1),
-               " │ 死叉?", is_dead ? "YES" : "NO",
-               "  J>", level, "?", above_level ? "YES" : "NO",
-               "  => ", (is_dead && above_level) ? "✅" : "✗");
-      }
-
-      if(is_dead && above_level)
-         return true;
-   }
-   return false;
+   k_val = iStochastic(_Symbol, 0, InpKDJK, InpKDJD, InpKDJSlowing,
+                       MODE_SMA, 0, MODE_MAIN, bar);
+   d_val = iStochastic(_Symbol, 0, InpKDJK, InpKDJD, InpKDJSlowing,
+                       MODE_SMA, 0, MODE_SIGNAL, bar);
+   return 3.0 * k_val - 2.0 * d_val;
 }
 
-//+==================================================================+
-//| KDJ 金叉检测（在过去 lookback 根K线内） + 在 level 线下方 [Debug版] |
-//+==================================================================+
-bool KDJGoldenCrossBelow(double level)
+//+------------------------------------------------------------------+
+//| 平仓                                                               |
+//+------------------------------------------------------------------+
+void ClosePosition(int ticket, string reason)
 {
-   if(InpDebugMode)
-      Print("  │    [KDJ(9,3,3) 金叉+J<", level, " 回溯", InpKDJLookback, "根]");
+   if(!OrderSelect(ticket, SELECT_BY_TICKET)) return;
 
-   for(int i = 1; i <= InpKDJLookback; i++)
-   {
-      double k_prev = iStochastic(_Symbol, 0, InpKDJK, InpKDJD, InpKDJSlowing,
-                                  MODE_SMA, 0, MODE_MAIN, i + 1);
-      double d_prev = iStochastic(_Symbol, 0, InpKDJK, InpKDJD, InpKDJSlowing,
-                                  MODE_SMA, 0, MODE_SIGNAL, i + 1);
-      double k_curr = iStochastic(_Symbol, 0, InpKDJK, InpKDJD, InpKDJSlowing,
-                                  MODE_SMA, 0, MODE_MAIN, i);
-      double d_curr = iStochastic(_Symbol, 0, InpKDJK, InpKDJD, InpKDJSlowing,
-                                  MODE_SMA, 0, MODE_SIGNAL, i);
-
-      double j_prev = 3.0 * k_prev - 2.0 * d_prev;
-
-      // 金叉: 前一根 K < D  →  当前 K > D
-      bool is_golden = (k_prev < d_prev && k_curr > d_curr);
-      bool below_level = (j_prev < level);
-
-      if(InpDebugMode)
-      {
-         Print("  │      bar[", i + 1, "]->bar[", i, "]: ",
-               "K(", DoubleToStr(k_prev, 1), "->", DoubleToStr(k_curr, 1), ") ",
-               "D(", DoubleToStr(d_prev, 1), "->", DoubleToStr(d_curr, 1), ") ",
-               "J(prev)=", DoubleToStr(j_prev, 1),
-               " │ 金叉?", is_golden ? "YES" : "NO",
-               "  J<", level, "?", below_level ? "YES" : "NO",
-               "  => ", (is_golden && below_level) ? "✅" : "✗");
-      }
-
-      if(is_golden && below_level)
-         return true;
-   }
-   return false;
-}
-
-//+==================================================================+
-//| 开空单                                                             |
-//+==================================================================+
-void OpenShort()
-{
    RefreshRates();
-   double bid      = MarketInfo(_Symbol, MODE_BID);
-   double lot      = InpLotSize;
-   double sl       = 0;   // 由 TPSL_Manager 接管
-   double tp       = 0;   // 由 TPSL_Manager 接管
+   double price = (OrderType() == OP_BUY) ? MarketInfo(_Symbol, MODE_BID)
+                                          : MarketInfo(_Symbol, MODE_ASK);
+   bool res = OrderClose(ticket, OrderLots(), price, InpSlippage, clrYellow);
 
-   int ticket = OrderSend(_Symbol, OP_SELL, lot, bid, InpSlippage,
-                          sl, tp, "MC_EA_Short", InpMagicNumber, 0, clrRed);
-
-   if(ticket > 0)
-   {
-      Print("━━━ ▶ 开空单成功  Ticket:", ticket,
-            "  价格:", DoubleToStr(bid, (int)MarketInfo(_Symbol, MODE_DIGITS)),
-            "  手数:", lot);
-   }
+   if(res)
+      Print("━━━ [", reason, "] 平仓 Ticket:", ticket,
+            "  盈利:", DoubleToStr(OrderProfit(), 2));
    else
-      Print("!!! 开空单失败  Error:", GetLastError());
+      Print("!!! 平仓失败 Ticket:", ticket, " Error:", GetLastError());
 }
 
-//+==================================================================+
+//+------------------------------------------------------------------+
 //| 开多单                                                             |
-//+==================================================================+
+//+------------------------------------------------------------------+
 void OpenLong()
 {
    RefreshRates();
-   double ask      = MarketInfo(_Symbol, MODE_ASK);
-   double lot      = InpLotSize;
-   double sl       = 0;   // 由 TPSL_Manager 接管
-   double tp       = 0;   // 由 TPSL_Manager 接管
-
-   int ticket = OrderSend(_Symbol, OP_BUY, lot, ask, InpSlippage,
-                          sl, tp, "MC_EA_Long", InpMagicNumber, 0, clrBlue);
-
+   double ask = MarketInfo(_Symbol, MODE_ASK);
+   int ticket = OrderSend(_Symbol, OP_BUY, InpLotSize, ask, InpSlippage,
+                          0, 0, "J_Tracker_Long", InpMagicNumber, 0, clrBlue);
    if(ticket > 0)
-   {
-      Print("━━━ ▶ 开多单成功  Ticket:", ticket,
-            "  价格:", DoubleToStr(ask, (int)MarketInfo(_Symbol, MODE_DIGITS)),
-            "  手数:", lot);
-   }
+      Print("━━━ ▶ [J谷做多] Ticket:", ticket,
+            "  价格:", DoubleToStr(ask, (int)MarketInfo(_Symbol, MODE_DIGITS)));
    else
-      Print("!!! 开多单失败  Error:", GetLastError());
+      Print("!!! 开多失败 Error:", GetLastError());
+}
+
+//+------------------------------------------------------------------+
+//| 开空单                                                             |
+//+------------------------------------------------------------------+
+void OpenShort()
+{
+   RefreshRates();
+   double bid = MarketInfo(_Symbol, MODE_BID);
+   int ticket = OrderSend(_Symbol, OP_SELL, InpLotSize, bid, InpSlippage,
+                          0, 0, "J_Tracker_Short", InpMagicNumber, 0, clrRed);
+   if(ticket > 0)
+      Print("━━━ ▶ [J峰做空] Ticket:", ticket,
+            "  价格:", DoubleToStr(bid, (int)MarketInfo(_Symbol, MODE_DIGITS)));
+   else
+      Print("!!! 开空失败 Error:", GetLastError());
 }
 //+------------------------------------------------------------------+
