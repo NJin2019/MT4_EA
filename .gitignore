@@ -1,0 +1,21 @@
+# MetaTrader compiled outputs
+*.ex4
+*.ex5
+*.dat
+
+
+# Logs and reports
+*.log
+*.tmp
+*.bak
+
+# Windows/editor clutter
+Thumbs.db
+.DS_Store
+.vscode/
+
+# Tester / generated files if present under this repo
+tester/
+logs/
+mqlcache.dat
+*.dat
